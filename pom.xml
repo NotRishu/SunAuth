@@ -1,0 +1,160 @@
+package com.rishuxd.plugin.utils;
+
+import com.rishuxd.plugin.AuthPlugin;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.UUID;
+import java.util.logging.Level;
+
+/**
+ * Manages persistent player data stored in players.yml.
+ * Handles reading/writing of username, hashed password, and premium status.
+ */
+public class PlayerDataManager {
+
+    private final AuthPlugin plugin;
+
+    /** The players.yml file on disk */
+    private File dataFile;
+
+    /** In-memory representation of players.yml */
+    private FileConfiguration dataConfig;
+
+    /** In-memory set of UUIDs that are currently authenticated this session */
+    private final Set<UUID> authenticatedPlayers = new HashSet<>();
+
+    public PlayerDataManager(AuthPlugin plugin) {
+        this.plugin = plugin;
+        loadData();
+    }
+
+    // ─────────────────────────────────────────────
+    // Data I/O
+    // ─────────────────────────────────────────────
+
+    /** Loads (or reloads) players.yml from disk into memory. */
+    public void loadData() {
+        dataFile = new File(plugin.getDataFolder(), "players.yml");
+
+        if (!dataFile.exists()) {
+            plugin.saveResource("players.yml", false);
+        }
+
+        dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+    }
+
+    /** Saves the in-memory dataConfig back to players.yml on disk. */
+    public void saveData() {
+        try {
+            dataConfig.save(dataFile);
+        } catch (IOException e) {
+            plugin.getLogger().log(Level.SEVERE, "Could not save players.yml!", e);
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Player Registration
+    // ─────────────────────────────────────────────
+
+    /**
+     * Registers a new cracked player with a hashed + encrypted password.
+     *
+     * @param playerName the player's name (lowercased key)
+     * @param rawPassword the plaintext password from the player
+     */
+    public void registerPlayer(String playerName, String rawPassword) {
+        String key = playerName.toLowerCase();
+
+        // Hash the password with SHA-256, then AES-encrypt the hash for storage
+        String hashed = PasswordUtil.hashPassword(rawPassword);
+        String encrypted = PasswordUtil.encryptAES(hashed);
+
+        dataConfig.set(key + ".username", playerName);
+        dataConfig.set(key + ".password", encrypted);   // stored as AES(SHA-256(password))
+        dataConfig.set(key + ".premium", false);
+
+        saveData();
+    }
+
+    // ─────────────────────────────────────────────
+    // Authentication
+    // ─────────────────────────────────────────────
+
+    /**
+     * Verifies a login attempt by:
+     *   1. Hashing the provided rawPassword with SHA-256
+     *   2. Encrypting that hash with AES
+     *   3. Comparing against the stored encrypted value
+     *
+     * @param playerName the player's name
+     * @param rawPassword the plaintext password provided at login
+     * @return true if credentials match
+     */
+    public boolean checkPassword(String playerName, String rawPassword) {
+        String key = playerName.toLowerCase();
+        String storedEncrypted = dataConfig.getString(key + ".password");
+        if (storedEncrypted == null) return false;
+
+        String inputEncrypted = PasswordUtil.encryptAES(PasswordUtil.hashPassword(rawPassword));
+        return storedEncrypted.equals(inputEncrypted);
+    }
+
+    /**
+     * Marks a player as authenticated for this session.
+     */
+    public void setAuthenticated(UUID uuid) {
+        authenticatedPlayers.add(uuid);
+    }
+
+    /**
+     * Removes authentication (e.g., on quit).
+     */
+    public void removeAuthenticated(UUID uuid) {
+        authenticatedPlayers.remove(uuid);
+    }
+
+    /**
+     * Returns true if the player has been authenticated this session.
+     */
+    public boolean isAuthenticated(UUID uuid) {
+        return authenticatedPlayers.contains(uuid);
+    }
+
+    // ─────────────────────────────────────────────
+    // Player Data Queries
+    // ─────────────────────────────────────────────
+
+    /**
+     * Returns true if the player has a registered account in players.yml.
+     */
+    public boolean isRegistered(String playerName) {
+        return dataConfig.contains(playerName.toLowerCase() + ".username");
+    }
+
+    /**
+     * Returns true if the player is flagged as premium in players.yml.
+     */
+    public boolean isPremium(String playerName) {
+        return dataConfig.getBoolean(playerName.toLowerCase() + ".premium", false);
+    }
+
+    /**
+     * Sets the player's premium flag and persists it immediately.
+     */
+    public void setPremium(String playerName, boolean value) {
+        dataConfig.set(playerName.toLowerCase() + ".premium", value);
+        saveData();
+    }
+
+    /**
+     * Exposes the raw FileConfiguration for advanced reads if needed.
+     */
+    public FileConfiguration getDataConfig() {
+        return dataConfig;
+    }
+}

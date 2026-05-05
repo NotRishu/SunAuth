@@ -1,0 +1,195 @@
+package com.rishuxd.plugin.listeners;
+
+import com.rishuxd.plugin.AuthPlugin;
+import com.rishuxd.plugin.utils.MessageUtil;
+import com.rishuxd.plugin.utils.PlayerDataManager;
+import io.papermc.paper.event.player.AsyncChatEvent;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.scheduler.BukkitTask;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * Handles all authentication-related events:
+ * - PlayerJoinEvent  → detect premium / cracked, start kick timer
+ * - PlayerMoveEvent  → block movement until authenticated
+ * - AsyncChatEvent   → block chat until authenticated
+ * - PlayerQuitEvent  → clean up session data
+ */
+public class AuthListener implements Listener {
+
+    private final AuthPlugin plugin;
+    private final PlayerDataManager dataManager;
+
+    /** Pending kick tasks: cancelled when player authenticates. */
+    private final Map<UUID, BukkitTask> kickTasks = new HashMap<>();
+
+    /** Tracks the join location so we can teleport back if player moves. */
+    private final Map<UUID, Location> joinLocations = new HashMap<>();
+
+    public AuthListener(AuthPlugin plugin) {
+        this.plugin = plugin;
+        this.dataManager = plugin.getPlayerDataManager();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Join
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @EventHandler(priority = EventPriority.NORMAL)
+    public void onPlayerJoin(PlayerJoinEvent event) {
+        Player player = event.getPlayer();
+        UUID uuid = player.getUniqueId();
+        String name = player.getName();
+
+        // Store join location
+        joinLocations.put(uuid, player.getLocation().clone());
+
+        // ── Premium detection ────────────────────────────────────────────────
+        // A UUID whose most-significant bit of version nibble == 4 (version 4 UUID)
+        // AND is flagged premium in our data, or the server detects online-mode.
+        // For hybrid servers (BungeeCord / offline), we rely on our players.yml flag.
+        boolean isPremium = dataManager.isPremium(name) || isOnlineModeUUID(uuid);
+
+        if (isPremium) {
+            // Auto-authenticate premium players
+            dataManager.setAuthenticated(uuid);
+            // Ensure premium flag is persisted
+            if (!dataManager.isPremium(name)) {
+                dataManager.setPremium(name, true);
+            }
+            String msg = plugin.getConfig().getString("messages.premium-welcome",
+                    "&aWelcome premium player!");
+            MessageUtil.send(player, msg);
+            return; // no kick timer needed
+        }
+
+        // ── Cracked player flow ──────────────────────────────────────────────
+        if (dataManager.isRegistered(name)) {
+            // Existing account → ask to login
+            String msg = plugin.getConfig().getString("messages.please-login",
+                    "&eYou have an account. Please /login <password>.");
+            MessageUtil.send(player, msg);
+        } else {
+            // No account → ask to register
+            String msg = plugin.getConfig().getString("messages.please-register",
+                    "&eWelcome! Please /register <password> <confirmPassword> to create an account.");
+            MessageUtil.send(player, msg);
+        }
+
+        // Start 30-second kick countdown
+        int timeout = plugin.getConfig().getInt("auth.timeout-seconds", 30);
+        BukkitTask task = Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            if (!dataManager.isAuthenticated(uuid) && player.isOnline()) {
+                String kickMsg = plugin.getConfig().getString("messages.kick-timeout",
+                        "&cYou took too long to log in!");
+                player.kick(MessageUtil.colorize(kickMsg));
+            }
+        }, timeout * 20L); // ticks
+
+        kickTasks.put(uuid, task);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Move — block until authenticated
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onPlayerMove(PlayerMoveEvent event) {
+        Player player = event.getPlayer();
+
+        if (dataManager.isAuthenticated(player.getUniqueId())) return;
+
+        // Allow head rotation but not positional movement
+        Location from = event.getFrom();
+        Location to   = event.getTo();
+
+        if (to == null) return;
+
+        boolean movedPosition = from.getBlockX() != to.getBlockX()
+                             || from.getBlockY() != to.getBlockY()
+                             || from.getBlockZ() != to.getBlockZ();
+
+        if (movedPosition) {
+            // Teleport back to join location
+            Location safe = joinLocations.getOrDefault(player.getUniqueId(), from);
+            event.setTo(safe.clone()
+                    .add(0, 0, 0)
+                    .setDirection(to.getDirection())); // preserve look direction
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Chat — block until authenticated (Paper's AsyncChatEvent)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = false)
+    public void onPlayerChat(AsyncChatEvent event) {
+        Player player = event.getPlayer();
+
+        if (!dataManager.isAuthenticated(player.getUniqueId())) {
+            event.setCancelled(true);
+            String msg = plugin.getConfig().getString("messages.chat-blocked",
+                    "&cYou must be logged in to chat!");
+            MessageUtil.send(player, msg);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Quit — clean up session
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        UUID uuid = event.getPlayer().getUniqueId();
+        dataManager.removeAuthenticated(uuid);
+        joinLocations.remove(uuid);
+
+        BukkitTask task = kickTasks.remove(uuid);
+        if (task != null) task.cancel();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Public helper — called by commands after successful login/register
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Cancels the pending kick timer for a player (called after authentication).
+     */
+    public void cancelKickTask(UUID uuid) {
+        BukkitTask task = kickTasks.remove(uuid);
+        if (task != null) task.cancel();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Internal
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Heuristically detects whether a UUID was issued by Mojang (online-mode).
+     *
+     * Mojang UUIDs are version 4 (random). Offline/cracked UUIDs are generated
+     * with UUID.nameUUIDFromBytes() which produces version 3. We check the version
+     * nibble of the UUID's most-significant long.
+     *
+     * Note: This is a best-effort check. For authoritative detection, use a
+     * premium-verification API (e.g., api.mojang.com) in production.
+     *
+     * @param uuid the player's UUID
+     * @return true if version == 4 (likely online/Mojang UUID)
+     */
+    private boolean isOnlineModeUUID(UUID uuid) {
+        return uuid.version() == 4;
+    }
+}
